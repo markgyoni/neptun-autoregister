@@ -18,7 +18,7 @@ COURSECHANGE_PATH = "SubjectApplication/CourseChange"
 
 # --- exam endpoints ---
 EXAMS_LIST_PATH = "ExamRegistration/GetExamsList"
-EXAM_REGISTER_PATH = "ExamRegistration/SaveExamRegistration"  # UNVERIFIED - confirm live
+EXAM_REGISTER_PATH = "ExamRegistration/SaveExamRegistration"
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +223,6 @@ class NeptunClient:
                          {"sortAndPage.firstRow": 0, "sortAndPage.lastRow": 9999})
 
     def register_exam(self, exam):
-        """UNVERIFIED endpoint/payload - confirm against a live exam signup."""
         return self._post(EXAM_REGISTER_PATH, {"examId": exam.get("id")})
 
 
@@ -441,7 +440,7 @@ def process_exam(client, idx, total, cfg, exams_by_subject, webhook):
         out(f"      OK Registered for exam on {_exam_date(target)}.")
         notify(webhook, f"✅ Registered exam **{subject.get('subjectName')}** ({code}) → {_exam_date(target)}")
     else:
-        out("      x Exam registration failed (endpoint unverified). See --verbose.")
+        out("      x Exam registration failed. See --verbose.")
 
 
 # ---------------------------------------------------------------------------
