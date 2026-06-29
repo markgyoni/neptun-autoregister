@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import argparse
 from pathlib import Path
 
@@ -307,6 +308,7 @@ def build_subject_index(client, term_value):
 
 
 def process_subject(client, idx, total, cfg, index, webhook):
+    """Returns True when nothing more needs to be done for this subject."""
     code = cfg.get("neptun_code")
     lecture_prefix = cfg.get("lecture")
     prefs = cfg.get("courses", [])
@@ -317,17 +319,17 @@ def process_subject(client, idx, total, cfg, index, webhook):
 
     if not row:
         out("      ! Not schedulable at this time. Skipping.")
-        return
+        return False
     courses = rows(client.get_subject_courses(row))
     if not courses:
         out("      ! No courses returned. Skipping.")
-        return
+        return False
 
     lecture = pick_lecture(courses, lecture_prefix) if lecture_prefix else None
     if lecture_prefix:
         if not lecture:
             out(f"      ! No lecture matching '{lecture_prefix}'. Skipping.")
-            return
+            return False
         out(f"      Lecture: {lecture.get('code')} [{lecture.get('type')}]  seats {seat_str(lecture)}")
 
     pref_courses = []
@@ -342,31 +344,35 @@ def process_subject(client, idx, total, cfg, index, webhook):
             out(f"        {rank}. {pref:<16} (not offered)")
 
     if row.get("isRegistered"):
-        _switch_if_better(client, code, row, courses, pref_courses, webhook)
+        return _switch_if_better(client, code, row, courses, pref_courses, webhook)
     else:
-        _register_subject(client, code, row, lecture, pref_courses, webhook)
+        return _register_subject(client, code, row, lecture, pref_courses, webhook)
 
 
 def _register_subject(client, code, row, lecture, pref_courses, webhook):
+    """Returns True if registered successfully, False if seats unavailable or period closed."""
     out("      Status: NOT REGISTERED")
     if lecture is not None and not seats_open(lecture):
         out(f"      x Lecture {lecture.get('code')} is FULL.")
-        return
+        return False
     chosen = next((c for _, c in pref_courses if c and seats_open(c)), None)
     if not chosen:
         out("      x No priority course has open seats.")
-        return
+        return False
 
     course_ids = ([lecture.get("id")] if lecture is not None else []) + [chosen.get("id")]
     out(f"      -> Registering course {chosen.get('code')}")
     if client.register_subject(row, course_ids) is not None:
         out(f"      OK Registered into {chosen.get('code')}.")
         notify(webhook, f"✅ Registered **{row.get('title')}** ({code}) → course {chosen.get('code')}")
+        return True
     else:
         out("      x Registration failed (registration period may be closed).")
+        return False
 
 
 def _switch_if_better(client, code, row, courses, pref_courses, webhook):
+    """Returns True when already in the best possible course (nothing left to do)."""
     signed_ids = {c.get("id") for c in courses if c.get("isSigned")}
     current = next((c for _, c in pref_courses if c and c.get("id") in signed_ids), None)
     out(f"      Status: REGISTERED (in {current.get('code') if current else '?'})")
@@ -376,21 +382,22 @@ def _switch_if_better(client, code, row, courses, pref_courses, webhook):
             continue
         if current is not None and c.get("id") == current.get("id"):
             out(f"      OK Already in top available course ({pref}). Nothing to do.")
-            return
+            return True
         if seats_open(c):
             index_line_id = row.get("indexlineId")
             if not index_line_id:
                 out("      x Missing indexlineId; cannot switch.")
-                return
+                return True  # registered, just can't improve
             out(f"      -> Switching to higher-priority {pref}")
             if client.change_course(index_line_id, c.get("id")) is not None:
                 out(f"      OK Switched to {pref}.")
                 notify(webhook, f"🔄 Switched **{row.get('title')}** ({code}) → course {pref}")
             else:
                 out("      x Switch failed. See --verbose.")
-            return
+            return True  # registered regardless of switch outcome
         out(f"      .. {pref} full, checking next")
     out("      OK No higher-priority course open. Staying put.")
+    return True  # registered in best available
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +421,7 @@ def _exam_seat_str(exam):
 
 
 def process_exam(client, idx, total, cfg, exams_by_subject, webhook):
+    """Returns True when registered (or already was), False if not yet possible."""
     code = cfg.get("neptun_code") or cfg.get("subject")
     wanted_dates = cfg.get("dates", [])
 
@@ -423,18 +431,18 @@ def process_exam(client, idx, total, cfg, exams_by_subject, webhook):
 
     if not subject:
         out("      ! No exams listed for this subject. Skipping.")
-        return
+        return False
 
     exam_list = subject.get("examList", [])
     if not exam_list:
         out("      ! Subject has no exams. Skipping.")
-        return
+        return False
 
     # Already registered to one of this subject's exams?
     already = next((e for e in exam_list if e.get("isRegistered") or e.get("isSigned")), None)
     if already:
         out(f"      OK Already registered for exam on {_exam_date(already)}. Nothing to do.")
-        return
+        return True
 
     # Build candidate list: preferred dates in order, else all exams by date.
     if wanted_dates:
@@ -449,14 +457,16 @@ def process_exam(client, idx, total, cfg, exams_by_subject, webhook):
     target = next((e for e in candidates if not _exam_full(e)), None)
     if not target:
         out("      x No open exam among your choices.")
-        return
+        return False
 
     out(f"      -> Registering for exam on {_exam_date(target)}")
     if client.register_exam(target) is not None:
         out(f"      OK Registered for exam on {_exam_date(target)}.")
         notify(webhook, f"✅ Registered exam **{subject.get('subjectName')}** ({code}) → {_exam_date(target)}")
+        return True
     else:
         out("      x Exam registration failed. See --verbose.")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +484,56 @@ def resolve_term(client):
         if t.get("isActualTerm"):
             return t.get("value"), t.get("text")
     return (terms[0].get("value"), terms[0].get("text")) if terms else (None, None)
+
+
+def run_once(client, neptun_id, subjects, exams, webhook):
+    """Authenticate and attempt all subject + exam registrations. Returns True if
+    every configured item is already registered (nothing left to do)."""
+    hr()
+    out(f" User: {neptun_id}")
+    if not client.authenticate():
+        out(" x Authentication failed. Check .env credentials.")
+        raise SystemExit(1)
+
+    all_done = True
+
+    # --- subjects ---
+    if subjects:
+        term_value, term_text = resolve_term(client)
+        out(f" Term: {term_text}")
+        hr()
+        out(" SUBJECTS")
+        index = build_subject_index(client, term_value) if term_value else {}
+        for i, cfg in enumerate(subjects, 1):
+            try:
+                done = process_subject(client, i, len(subjects), cfg, index, webhook)
+                if not done:
+                    all_done = False
+            except Exception as e:
+                debug(f"subject {cfg.get('neptun_code')} error: {e}")
+                all_done = False
+
+    # --- exams ---
+    if exams:
+        out()
+        hr()
+        out(" EXAMS")
+        exams_by_subject = {s.get("subjectCode"): s for s in rows(client.get_exams())}
+        for i, cfg in enumerate(exams, 1):
+            try:
+                done = process_exam(client, i, len(exams), cfg, exams_by_subject, webhook)
+                if not done:
+                    all_done = False
+            except Exception as e:
+                debug(f"exam {cfg.get('neptun_code')} error: {e}")
+                all_done = False
+
+    out()
+    hr()
+    out(" Done.")
+    hr()
+
+    return all_done
 
 
 def main():
@@ -498,44 +558,43 @@ def main():
     base_url = config.get("base_url")
     subjects = config.get("subjects", [])
     exams = config.get("exams", [])
+    loop = config.get("loop", False)
+    loop_delay = int(config.get("loop_delay", 30))
 
     client = NeptunClient(neptun_id, password, base_url=base_url, token_cache_path=args.token_cache)
 
-    hr()
-    out(f" User: {neptun_id}")
-    if not client.authenticate():
-        out(" x Authentication failed. Check .env credentials.")
-        raise SystemExit(1)
+    if not loop:
+        run_once(client, neptun_id, subjects, exams, webhook)
+        return
 
-    # --- subjects ---
-    if subjects:
-        term_value, term_text = resolve_term(client)
-        out(f" Term: {term_text}")
-        hr()
-        out(" SUBJECTS")
-        index = build_subject_index(client, term_value) if term_value else {}
-        for i, cfg in enumerate(subjects, 1):
-            try:
-                process_subject(client, i, len(subjects), cfg, index, webhook)
-            except Exception as e:
-                debug(f"subject {cfg.get('neptun_code')} error: {e}")
-
-    # --- exams ---
-    if exams:
+    # --- loop mode ---
+    attempt = 0
+    out(f" Loop mode enabled — retrying every {loop_delay}s. Press Ctrl+C to stop.")
+    while True:
+        attempt += 1
         out()
-        hr()
-        out(" EXAMS")
-        exams_by_subject = {s.get("subjectCode"): s for s in rows(client.get_exams())}
-        for i, cfg in enumerate(exams, 1):
-            try:
-                process_exam(client, i, len(exams), cfg, exams_by_subject, webhook)
-            except Exception as e:
-                debug(f"exam {cfg.get('neptun_code')} error: {e}")
+        hr("=")
+        out(f" Attempt #{attempt}")
+        hr("=")
+        try:
+            all_done = run_once(client, neptun_id, subjects, exams, webhook)
+        except SystemExit:
+            raise
+        except Exception as e:
+            out(f" ! Unexpected error: {e}")
+            all_done = False
 
-    out()
-    hr()
-    out(" Done.")
-    hr()
+        if all_done:
+            out(" All items registered. Exiting loop.")
+            break
+
+        out(f" Waiting {loop_delay}s before next attempt... (Ctrl+C to stop)")
+        try:
+            time.sleep(loop_delay)
+        except KeyboardInterrupt:
+            out()
+            out(" Interrupted. Exiting.")
+            break
 
 
 if __name__ == "__main__":
