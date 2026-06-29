@@ -110,6 +110,16 @@ class NeptunClient:
                 debug(f"Failed to load cached token: {e}")
         return False
 
+    def _force_refresh(self):
+        """Delete cached token and re-authenticate against the server."""
+        try:
+            Path(self._token_cache_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        self.session.headers.pop("Authorization", None)
+        self.token = None
+        self.authenticate()
+
     def _url(self, path):
         return f"{self.base_url}/{path}"
 
@@ -146,9 +156,12 @@ class NeptunClient:
     def _get(self, path, params=None):
         resp = self.session.get(self._url(path), params=params)
         if resp.status_code == 401:
-            debug("Token expired, re-authenticating...")
-            self.authenticate()
+            debug("Token expired, forcing re-auth...")
+            self._force_refresh()
             resp = self.session.get(self._url(path), params=params)
+        if resp.status_code == 401:
+            debug("Still 401 after re-auth — credentials may have changed.")
+            return None
         if resp.status_code != 200:
             debug(f"GET {path} status {resp.status_code}: {resp.text[:200]}")
             return None
@@ -161,9 +174,12 @@ class NeptunClient:
     def _post(self, path, payload):
         resp = self.session.post(self._url(path), json=payload)
         if resp.status_code == 401:
-            debug("Token expired, re-authenticating...")
-            self.authenticate()
+            debug("Token expired, forcing re-auth...")
+            self._force_refresh()
             resp = self.session.post(self._url(path), json=payload)
+        if resp.status_code == 401:
+            debug("Still 401 after re-auth — credentials may have changed.")
+            return None
         debug(f"POST {path} -> {resp.status_code} {resp.text[:300]}")
         if resp.status_code not in (200, 201):
             return None
@@ -300,7 +316,7 @@ def process_subject(client, idx, total, cfg, index, webhook):
     out(f"[{idx}/{total}] {row.get('title') if row else '?'} ({code})")
 
     if not row:
-        out("      ! Not offered this term. Skipping.")
+        out("      ! Not schedulable at this time. Skipping.")
         return
     courses = rows(client.get_subject_courses(row))
     if not courses:
@@ -334,11 +350,11 @@ def process_subject(client, idx, total, cfg, index, webhook):
 def _register_subject(client, code, row, lecture, pref_courses, webhook):
     out("      Status: NOT REGISTERED")
     if lecture is not None and not seats_open(lecture):
-        out(f"      x Lecture {lecture.get('code')} is FULL. Will retry next run.")
+        out(f"      x Lecture {lecture.get('code')} is FULL.")
         return
     chosen = next((c for _, c in pref_courses if c and seats_open(c)), None)
     if not chosen:
-        out("      x No priority course has open seats. Will retry next run.")
+        out("      x No priority course has open seats.")
         return
 
     course_ids = ([lecture.get("id")] if lecture is not None else []) + [chosen.get("id")]
@@ -347,7 +363,7 @@ def _register_subject(client, code, row, lecture, pref_courses, webhook):
         out(f"      OK Registered into {chosen.get('code')}.")
         notify(webhook, f"✅ Registered **{row.get('title')}** ({code}) → course {chosen.get('code')}")
     else:
-        out("      x Registration failed. See --verbose.")
+        out("      x Registration failed (registration period may be closed).")
 
 
 def _switch_if_better(client, code, row, courses, pref_courses, webhook):
@@ -432,7 +448,7 @@ def process_exam(client, idx, total, cfg, exams_by_subject, webhook):
 
     target = next((e for e in candidates if not _exam_full(e)), None)
     if not target:
-        out("      x No open exam among your choices. Will retry next run.")
+        out("      x No open exam among your choices.")
         return
 
     out(f"      -> Registering for exam on {_exam_date(target)}")
