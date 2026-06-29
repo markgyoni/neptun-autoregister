@@ -1,0 +1,16 @@
+{
+  "base_url": "xxx/api",
+  "subjects": [
+    {
+      "neptun_code": "a",
+      "lecture": "b",
+      "courses": ["c", "d"]
+    }
+  ],
+  "exams": [
+    {
+      "neptun_code": "a",
+      "dates": ["2026-01-01", "2026-01-02"]
+    }
+  ]
+}

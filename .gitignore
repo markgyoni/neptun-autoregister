@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+env/
+venv/
+config.json
+.playwright-mcp/
+.claude
+.neptun-token.json
