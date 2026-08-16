@@ -28,10 +28,21 @@ EXAM_REGISTER_PATH = "ExamRegistration/SaveExamRegistration"
 # ---------------------------------------------------------------------------
 
 VERBOSE = False
+LOG_FILE = None
+
+
+def _log_line(level, msg):
+    if LOG_FILE is None:
+        return
+    text = str(msg)
+    timestamp = datetime.now().isoformat(sep=" ", timespec="seconds")
+    LOG_FILE.write(f"[{timestamp}] [{level}] {text}\n")
+    LOG_FILE.flush()
 
 
 def out(msg=""):
     print(msg)
+    _log_line("OUT", msg)
 
 
 def hr(char="="):
@@ -41,6 +52,7 @@ def hr(char="="):
 def debug(msg):
     if VERBOSE:
         print(f"  [debug] {msg}", file=sys.stderr)
+        _log_line("DEBUG", msg)
 
 
 # ---------------------------------------------------------------------------
@@ -574,95 +586,109 @@ def run_once(client, neptun_id, subjects, exams, webhook):
 
 
 def main():
-    global VERBOSE
+    global VERBOSE, LOG_FILE
     parser = argparse.ArgumentParser(description="Neptun subject + exam automation")
     parser.add_argument("--config", default="config.json", help="Path to config.json")
     parser.add_argument("--env", default=".env", help="Path to .env file")
     parser.add_argument("--verbose", action="store_true", help="Print debug detail to stderr")
+    parser.add_argument("--log", action="store_true", help="Write output to log.txt")
     parser.add_argument("--token-cache", default=".neptun-token.json", help="Path to token cache file")
     args = parser.parse_args()
     VERBOSE = args.verbose
 
-    load_env(args.env)
-    neptun_id = os.environ.get("NEPTUNID")
-    password = os.environ.get("NEPTUN_PASSWORD")
-    webhook = os.environ.get("DISCORD_WEBHOOK")
-
-    if not neptun_id or not password:
-        raise SystemExit("Set NEPTUNID and NEPTUN_PASSWORD in .env")
-
-    config = load_config(args.config)
-    base_url = config.get("base_url")
-    subjects = config.get("subjects", [])
-    exams = config.get("exams", [])
-    loop = config.get("loop", False)
-    loop_delay = int(config.get("loop_delay", 30))
-    completed = bool(config.get("completed", False))
-
-    if completed:
-        out("completed=true in config, skipping")
-        return
+    if args.log:
+        try:
+            LOG_FILE = open("log.txt", "a", encoding="utf-8")
+            _log_line("INFO", "--- run started ---")
+        except OSError as e:
+            raise SystemExit(f"Failed to open log.txt: {e}")
 
     try:
-        registration_start = parse_registration_start(config.get("registration_start"))
-    except ValueError as e:
-        raise SystemExit(str(e))
+        load_env(args.env)
+        neptun_id = os.environ.get("NEPTUNID")
+        password = os.environ.get("NEPTUN_PASSWORD")
+        webhook = os.environ.get("DISCORD_WEBHOOK")
 
-    if registration_start is not None:
-        now = datetime.now(registration_start.tzinfo) if registration_start.tzinfo else datetime.now()
-        if now < (registration_start - timedelta(minutes=1)):
-            out(
-                "Current time is more than 1 minute before registration start"
-            )
-            out(f" Now:   {now.isoformat(sep=' ', timespec='seconds')}")
-            out(f" Start: {registration_start.isoformat(sep=' ', timespec='seconds')}")
+        if not neptun_id or not password:
+            raise SystemExit("Set NEPTUNID and NEPTUN_PASSWORD in .env")
+
+        config = load_config(args.config)
+        base_url = config.get("base_url")
+        subjects = config.get("subjects", [])
+        exams = config.get("exams", [])
+        loop = config.get("loop", False)
+        loop_delay = int(config.get("loop_delay", 30))
+        completed = bool(config.get("completed", False))
+
+        if completed:
+            out("completed=true in config, skipping")
             return
 
-    client = NeptunClient(neptun_id, password, base_url=base_url, token_cache_path=args.token_cache)
-
-    if not loop:
-        _, subjects_done = run_once(client, neptun_id, subjects, exams, webhook)
-        if subjects and subjects_done and not completed:
-            config["completed"] = True
-            save_config(args.config, config)
-            out(" All configured subjects are registered. Setting completed=true in config.")
-        return
-
-    # --- loop mode ---
-    attempt = 0
-    out(f" Loop mode enabled — retrying every {loop_delay}s. Press Ctrl+C to stop.")
-    while True:
-        attempt += 1
-        out()
-        hr("=")
-        out(f" Attempt #{attempt}")
-        hr("=")
         try:
-            all_done, subjects_done = run_once(client, neptun_id, subjects, exams, webhook)
-        except SystemExit:
-            raise
-        except Exception as e:
-            out(f" ! Unexpected error: {e}")
-            all_done = False
-            subjects_done = False
+            registration_start = parse_registration_start(config.get("registration_start"))
+        except ValueError as e:
+            raise SystemExit(str(e))
 
-        if subjects and subjects_done and not completed:
-            config["completed"] = True
-            save_config(args.config, config)
-            out(" All configured subjects are registered. Set completed=true in config.")
-            completed = True
+        if registration_start is not None:
+            now = datetime.now(registration_start.tzinfo) if registration_start.tzinfo else datetime.now()
+            if now < (registration_start - timedelta(minutes=1)):
+                out(
+                    "Current time is more than 1 minute before registration start"
+                )
+                out(f" Now:   {now.isoformat(sep=' ', timespec='seconds')}")
+                out(f" Start: {registration_start.isoformat(sep=' ', timespec='seconds')}")
+                return
 
-        if all_done:
-            out(" All items registered. Exiting loop.")
-            break
+        client = NeptunClient(neptun_id, password, base_url=base_url, token_cache_path=args.token_cache)
 
-        out(f" Waiting {loop_delay}s before next attempt... (Ctrl+C to stop)")
-        try:
-            time.sleep(loop_delay)
-        except KeyboardInterrupt:
+        if not loop:
+            _, subjects_done = run_once(client, neptun_id, subjects, exams, webhook)
+            if subjects and subjects_done and not completed:
+                config["completed"] = True
+                save_config(args.config, config)
+                out(" All configured subjects are registered. Setting completed=true in config.")
+            return
+
+        # --- loop mode ---
+        attempt = 0
+        out(f" Loop mode enabled — retrying every {loop_delay}s. Press Ctrl+C to stop.")
+        while True:
+            attempt += 1
             out()
-            out(" Interrupted. Exiting.")
-            break
+            hr("=")
+            out(f" Attempt #{attempt}")
+            hr("=")
+            try:
+                all_done, subjects_done = run_once(client, neptun_id, subjects, exams, webhook)
+            except SystemExit:
+                raise
+            except Exception as e:
+                out(f" ! Unexpected error: {e}")
+                all_done = False
+                subjects_done = False
+
+            if subjects and subjects_done and not completed:
+                config["completed"] = True
+                save_config(args.config, config)
+                out(" All configured subjects are registered. Set completed=true in config.")
+                completed = True
+
+            if all_done:
+                out(" All items registered. Exiting loop.")
+                break
+
+            out(f" Waiting {loop_delay}s before next attempt... (Ctrl+C to stop)")
+            try:
+                time.sleep(loop_delay)
+            except KeyboardInterrupt:
+                out()
+                out(" Interrupted. Exiting.")
+                break
+    finally:
+        if LOG_FILE is not None:
+            _log_line("INFO", "--- run ended ---")
+            LOG_FILE.close()
+            LOG_FILE = None
 
 
 if __name__ == "__main__":
