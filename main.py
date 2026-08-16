@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import argparse
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -478,6 +479,39 @@ def load_config(path):
         return json.load(f)
 
 
+def save_config(path, config):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def parse_registration_start(value):
+    """Parse config registration start datetime.
+
+    Accepted examples:
+      - 2026-09-01 17:59:00
+      - 2026-09-01T17:59:00
+      - 2026-09-01T17:59:00+02:00
+      - 2026-09-01T15:59:00Z
+    """
+    if not value:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("registration_start must be a string")
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError as e:
+        raise ValueError(
+            "Invalid registration_start format. Use ISO datetime like "
+            "'2026-09-01 17:59:00' or '2026-09-01T17:59:00+02:00'."
+        ) from e
+
+
 def resolve_term(client):
     terms = rows(client.get_terms())
     for t in terms:
@@ -496,6 +530,7 @@ def run_once(client, neptun_id, subjects, exams, webhook):
         raise SystemExit(1)
 
     all_done = True
+    subjects_done = True
 
     # --- subjects ---
     if subjects:
@@ -509,9 +544,11 @@ def run_once(client, neptun_id, subjects, exams, webhook):
                 done = process_subject(client, i, len(subjects), cfg, index, webhook)
                 if not done:
                     all_done = False
+                    subjects_done = False
             except Exception as e:
                 debug(f"subject {cfg.get('neptun_code')} error: {e}")
                 all_done = False
+                subjects_done = False
 
     # --- exams ---
     if exams:
@@ -533,7 +570,7 @@ def run_once(client, neptun_id, subjects, exams, webhook):
     out(" Done.")
     hr()
 
-    return all_done
+    return all_done, subjects_done
 
 
 def main():
@@ -560,11 +597,35 @@ def main():
     exams = config.get("exams", [])
     loop = config.get("loop", False)
     loop_delay = int(config.get("loop_delay", 30))
+    completed = bool(config.get("completed", False))
+
+    if completed:
+        out("completed=true in config, skipping")
+        return
+
+    try:
+        registration_start = parse_registration_start(config.get("registration_start"))
+    except ValueError as e:
+        raise SystemExit(str(e))
+
+    if registration_start is not None:
+        now = datetime.now(registration_start.tzinfo) if registration_start.tzinfo else datetime.now()
+        if now < (registration_start - timedelta(minutes=1)):
+            out(
+                "Current time is more than 1 minute before registration start"
+            )
+            out(f" Now:   {now.isoformat(sep=' ', timespec='seconds')}")
+            out(f" Start: {registration_start.isoformat(sep=' ', timespec='seconds')}")
+            return
 
     client = NeptunClient(neptun_id, password, base_url=base_url, token_cache_path=args.token_cache)
 
     if not loop:
-        run_once(client, neptun_id, subjects, exams, webhook)
+        _, subjects_done = run_once(client, neptun_id, subjects, exams, webhook)
+        if subjects and subjects_done and not completed:
+            config["completed"] = True
+            save_config(args.config, config)
+            out(" All configured subjects are registered. Setting completed=true in config.")
         return
 
     # --- loop mode ---
@@ -577,12 +638,19 @@ def main():
         out(f" Attempt #{attempt}")
         hr("=")
         try:
-            all_done = run_once(client, neptun_id, subjects, exams, webhook)
+            all_done, subjects_done = run_once(client, neptun_id, subjects, exams, webhook)
         except SystemExit:
             raise
         except Exception as e:
             out(f" ! Unexpected error: {e}")
             all_done = False
+            subjects_done = False
+
+        if subjects and subjects_done and not completed:
+            config["completed"] = True
+            save_config(args.config, config)
+            out(" All configured subjects are registered. Set completed=true in config.")
+            completed = True
 
         if all_done:
             out(" All items registered. Exiting loop.")
