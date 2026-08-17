@@ -1,7 +1,7 @@
 {
   "base_url": "xxx/api",
   "registration_start": "2026-09-01T00:00:00+02:00",
-  "loop": false,
+  "loop_tries": 10,
   "loop_delay": 30,
   "subjects": [
     {

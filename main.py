@@ -3,7 +3,7 @@ import sys
 import json
 import time
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -524,6 +524,34 @@ def parse_registration_start(value):
         ) from e
 
 
+def wait_until_registration_start(registration_start):
+    """Block until registration start; refresh current time on a single line."""
+    if registration_start is None:
+        return
+
+    last_len = 0
+    while True:
+        now = datetime.now(registration_start.tzinfo) if registration_start.tzinfo else datetime.now()
+        if now >= registration_start:
+            break
+
+        line = (
+            "Waiting for registration start... "
+            f"Now: {now.isoformat(sep=' ', timespec='seconds')} | "
+            f"Start: {registration_start.isoformat(sep=' ', timespec='seconds')}"
+        )
+        pad = " " * max(0, last_len - len(line))
+        sys.stdout.write("\r" + line + pad)
+        sys.stdout.flush()
+        last_len = len(line)
+        time.sleep(1)
+
+    if last_len:
+        sys.stdout.write("\r" + (" " * last_len) + "\r")
+        sys.stdout.flush()
+    out("Registration start reached. Continuing.")
+
+
 def resolve_term(client):
     terms = rows(client.get_terms())
     for t in terms:
@@ -616,8 +644,8 @@ def main():
         base_url = config.get("base_url")
         subjects = config.get("subjects", [])
         exams = config.get("exams", [])
-        loop = config.get("loop", False)
         loop_delay = int(config.get("loop_delay", 30))
+        loop_tries = int(config.get("loop_tries", 1))
         completed = bool(config.get("completed", False))
 
         if completed:
@@ -629,35 +657,21 @@ def main():
         except ValueError as e:
             raise SystemExit(str(e))
 
-        if registration_start is not None:
-            now = datetime.now(registration_start.tzinfo) if registration_start.tzinfo else datetime.now()
-            if now < (registration_start - timedelta(minutes=1)):
-                out(
-                    "Current time is more than 1 minute before registration start"
-                )
-                out(f" Now:   {now.isoformat(sep=' ', timespec='seconds')}")
-                out(f" Start: {registration_start.isoformat(sep=' ', timespec='seconds')}")
-                return
+        if loop_tries < 1:
+            raise SystemExit("loop_tries must be >= 1")
+
+        wait_until_registration_start(registration_start)
 
         client = NeptunClient(neptun_id, password, base_url=base_url, token_cache_path=args.token_cache)
 
-        if not loop:
-            _, subjects_done = run_once(client, neptun_id, subjects, exams, webhook)
-            if subjects and subjects_done and not completed:
-                config["completed"] = True
-                save_config(args.config, config)
-                out(" All configured subjects are registered. Setting completed=true in config.")
-            return
+        for attempt in range(1, loop_tries + 1):
+            if loop_tries > 1:
+                out()
+                hr("=")
+                out(f" Attempt #{attempt}/{loop_tries}")
+                hr("=")
 
-        # --- loop mode ---
-        attempt = 0
-        out(f" Loop mode enabled — retrying every {loop_delay}s. Press Ctrl+C to stop.")
-        while True:
-            attempt += 1
             out()
-            hr("=")
-            out(f" Attempt #{attempt}")
-            hr("=")
             try:
                 all_done, subjects_done = run_once(client, neptun_id, subjects, exams, webhook)
             except SystemExit:
@@ -674,16 +688,19 @@ def main():
                 completed = True
 
             if all_done:
-                out(" All items registered. Exiting loop.")
+                out(" All items registered. Exiting.")
                 break
 
-            out(f" Waiting {loop_delay}s before next attempt... (Ctrl+C to stop)")
-            try:
-                time.sleep(loop_delay)
-            except KeyboardInterrupt:
-                out()
-                out(" Interrupted. Exiting.")
-                break
+            if attempt < loop_tries:
+                out(f" Waiting {loop_delay}s before next attempt...")
+                try:
+                    time.sleep(loop_delay)
+                except KeyboardInterrupt:
+                    out()
+                    out(" Interrupted. Exiting.")
+                    break
+            else:
+                out(" Reached configured loop_tries limit. Exiting.")
     finally:
         if LOG_FILE is not None:
             _log_line("INFO", "--- run ended ---")
