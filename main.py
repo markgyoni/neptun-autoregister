@@ -286,7 +286,7 @@ def seat_str(course):
 
 
 def pick_lecture(courses, prefix):
-    """EA lecture matching `prefix`, excluding longer-suffixed variants.
+    """EA lecture, e-learning, or exam course matching `prefix`, excluding longer-suffixed variants.
     'SzGH_EA' matches 'SzGH_EA' but NOT 'SzGH_EA_SLG'.
     """
     exact = [c for c in courses if (c.get("code") or "") == prefix]
@@ -295,9 +295,16 @@ def pick_lecture(courses, prefix):
     candidates = [c for c in courses
                   if (c.get("code") or "").startswith(prefix)
                   and not (c.get("code") or "")[len(prefix):].startswith("_")]
-    if len(candidates) > 1:
-        debug(f"Lecture prefix '{prefix}' matched {len(candidates)}; using {candidates[0].get('code')}")
-    return candidates[0] if candidates else None
+    if candidates:
+        if len(candidates) > 1:
+            debug(f"Lecture prefix '{prefix}' matched {len(candidates)}; using {candidates[0].get('code')}")
+        return candidates[0]
+    fallback = [c for c in courses if (c.get("code") or "").startswith(prefix)]
+    if fallback:
+        if len(fallback) > 1:
+            debug(f"Lecture fallback prefix '{prefix}' matched {len(fallback)}; using {fallback[0].get('code')}")
+        return fallback[0]
+    return None
 
 
 def find_course(courses, code):
@@ -338,6 +345,10 @@ def process_subject(client, idx, total, cfg, index, webhook):
         out("      ! No courses returned. Skipping.")
         return False
 
+    if not lecture_prefix and not prefs:
+        out("      ! Neither lecture nor courses specified in config. Skipping.")
+        return False
+
     lecture = pick_lecture(courses, lecture_prefix) if lecture_prefix else None
     if lecture_prefix:
         if not lecture:
@@ -346,15 +357,16 @@ def process_subject(client, idx, total, cfg, index, webhook):
         out(f"      Lecture: {lecture.get('code')} [{lecture.get('type')}]  seats {seat_str(lecture)}")
 
     pref_courses = []
-    out("      Course priority:")
-    for rank, pref in enumerate(prefs, 1):
-        c = find_course(courses, pref)
-        pref_courses.append((pref, c))
-        if c:
-            tag = "   <- enrolled" if c.get("isSigned") else ""
-            out(f"        {rank}. {pref:<16} seats {seat_str(c)}{tag}")
-        else:
-            out(f"        {rank}. {pref:<16} (not offered)")
+    if prefs:
+        out("      Course priority:")
+        for rank, pref in enumerate(prefs, 1):
+            c = find_course(courses, pref)
+            pref_courses.append((pref, c))
+            if c:
+                tag = "   <- enrolled" if c.get("isSigned") else ""
+                out(f"        {rank}. {pref:<16} seats {seat_str(c)}{tag}")
+            else:
+                out(f"        {rank}. {pref:<16} (not offered)")
 
     if row.get("isRegistered"):
         return _switch_if_better(client, code, row, courses, pref_courses, webhook)
@@ -365,19 +377,32 @@ def process_subject(client, idx, total, cfg, index, webhook):
 def _register_subject(client, code, row, lecture, pref_courses, webhook):
     """Returns True if registered successfully, False if seats unavailable or period closed."""
     out("      Status: NOT REGISTERED")
-    if lecture is not None and not seats_open(lecture):
-        out(f"      x Lecture {lecture.get('code')} is FULL.")
-        return False
-    chosen = next((c for _, c in pref_courses if c and seats_open(c)), None)
-    if not chosen:
-        out("      x No priority course has open seats.")
+    course_ids = []
+    registered_names = []
+
+    if lecture is not None:
+        if not seats_open(lecture):
+            out(f"      x Lecture/Course {lecture.get('code')} is FULL.")
+            return False
+        course_ids.append(lecture.get("id"))
+        registered_names.append(lecture.get("code"))
+
+    if pref_courses:
+        chosen = next((c for _, c in pref_courses if c and seats_open(c)), None)
+        if not chosen:
+            out("      x No priority course has open seats.")
+            return False
+        course_ids.append(chosen.get("id"))
+        registered_names.append(chosen.get("code"))
+    elif lecture is None:
+        out("      x No lecture or courses to register.")
         return False
 
-    course_ids = ([lecture.get("id")] if lecture is not None else []) + [chosen.get("id")]
-    out(f"      -> Registering course {chosen.get('code')}")
+    target_desc = " + ".join(registered_names)
+    out(f"      -> Registering {target_desc}")
     if client.register_subject(row, course_ids) is not None:
-        out(f"      OK Registered into {chosen.get('code')}.")
-        notify(webhook, f"✅ Registered **{row.get('title')}** ({code}) → course {chosen.get('code')}")
+        out(f"      OK Registered into {target_desc}.")
+        notify(webhook, f"✅ Registered **{row.get('title')}** ({code}) → {target_desc}")
         return True
     else:
         out("      x Registration failed (registration period may be closed).")
@@ -386,9 +411,16 @@ def _register_subject(client, code, row, lecture, pref_courses, webhook):
 
 def _switch_if_better(client, code, row, courses, pref_courses, webhook):
     """Returns True when already in the best possible course (nothing left to do)."""
-    signed_ids = {c.get("id") for c in courses if c.get("isSigned")}
+    signed_courses = [c for c in courses if c.get("isSigned")]
+    signed_ids = {c.get("id") for c in signed_courses}
+    signed_str = ", ".join(c.get("code", "?") for c in signed_courses) if signed_courses else "?"
+    out(f"      Status: REGISTERED (in {signed_str})")
+
+    if not pref_courses:
+        out("      OK Already registered. Nothing to do.")
+        return True
+
     current = next((c for _, c in pref_courses if c and c.get("id") in signed_ids), None)
-    out(f"      Status: REGISTERED (in {current.get('code') if current else '?'})")
 
     for pref, c in pref_courses:
         if not c:
