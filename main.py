@@ -311,6 +311,24 @@ def find_course(courses, code):
     return next((c for c in courses if (c.get("code") or "") == code), None)
 
 
+def match_course(course, target):
+    """Matches course either by course code string or numeric/string ID."""
+    target_str = str(target).strip()
+    c_code = str(course.get("code") or "").strip()
+    c_id = str(course.get("id") or "").strip()
+    return c_code == target_str or c_id == target_str
+
+
+def open_seats_count(course):
+    """Returns number of available seats if limits are specified, else None."""
+    mx = course.get("maxLimit")
+    reg = course.get("registeredStudentsCount") or 0
+    if isinstance(mx, int) and mx > 0:
+        return max(0, mx - reg)
+    return None
+
+
+
 # ---------------------------------------------------------------------------
 # subject handling
 # ---------------------------------------------------------------------------
@@ -515,6 +533,223 @@ def process_exam(client, idx, total, cfg, exams_by_subject, webhook):
 
 
 # ---------------------------------------------------------------------------
+# course monitoring
+# ---------------------------------------------------------------------------
+
+def parse_check_interval(cfg):
+    """Parse check interval from config in seconds, defaulting to 300 (5 minutes)."""
+    if "check_interval_minutes" in cfg:
+        try:
+            return max(1, int(float(cfg["check_interval_minutes"]) * 60))
+        except (ValueError, TypeError):
+            pass
+    if "interval_minutes" in cfg:
+        try:
+            return max(1, int(float(cfg["interval_minutes"]) * 60))
+        except (ValueError, TypeError):
+            pass
+    for key in ("check_interval", "interval", "check_interval_seconds", "loop_delay"):
+        if key in cfg:
+            try:
+                return max(1, int(cfg[key]))
+            except (ValueError, TypeError):
+                pass
+    return 300
+
+
+def check_monitored_subjects(client, monitor_cfg, index):
+    """Check configured subjects and courses for open seats.
+
+    Returns a list of dicts for courses that have open seats:
+      [
+        {
+          "subject_title": ...,
+          "subject_code": ...,
+          "course_code": ...,
+          "course_id": ...,
+          "seat_str": ...,
+          "open_count": ...,
+        }
+      ]
+    """
+    open_courses = []
+    subjects_cfg = monitor_cfg.get("subjects")
+
+    if subjects_cfg is not None:
+        for s_cfg in subjects_cfg:
+            code = s_cfg.get("neptun_code")
+            if not code:
+                continue
+            row = index.get(code)
+            if not row:
+                debug(f"Subject {code} not schedulable right now.")
+                continue
+
+            subject_title = row.get("title") or code
+            courses = rows(client.get_subject_courses(row))
+            if not courses:
+                debug(f"No courses returned for {code}")
+                continue
+
+            targets = s_cfg.get("courses") or s_cfg.get("course_ids")
+            lecture_prefix = s_cfg.get("lecture")
+            checked_course_ids = set()
+
+            if targets:
+                for target in targets:
+                    matched = [c for c in courses if match_course(c, target)]
+                    for c in matched:
+                        c_id = c.get("id")
+                        if c_id in checked_course_ids:
+                            continue
+                        checked_course_ids.add(c_id)
+                        if seats_open(c):
+                            open_courses.append({
+                                "subject_title": subject_title,
+                                "subject_code": code,
+                                "course_code": c.get("code") or "?",
+                                "course_id": c_id,
+                                "seat_str": seat_str(c),
+                                "open_count": open_seats_count(c),
+                            })
+            else:
+                if not lecture_prefix:
+                    for c in courses:
+                        c_id = c.get("id")
+                        if c_id in checked_course_ids:
+                            continue
+                        checked_course_ids.add(c_id)
+                        if seats_open(c):
+                            open_courses.append({
+                                "subject_title": subject_title,
+                                "subject_code": code,
+                                "course_code": c.get("code") or "?",
+                                "course_id": c_id,
+                                "seat_str": seat_str(c),
+                                "open_count": open_seats_count(c),
+                            })
+
+            if lecture_prefix:
+                lec = pick_lecture(courses, lecture_prefix)
+                if lec:
+                    l_id = lec.get("id")
+                    if l_id not in checked_course_ids and seats_open(lec):
+                        checked_course_ids.add(l_id)
+                        open_courses.append({
+                            "subject_title": subject_title,
+                            "subject_code": code,
+                            "course_code": lec.get("code") or "?",
+                            "course_id": l_id,
+                            "seat_str": seat_str(lec),
+                            "open_count": open_seats_count(lec),
+                        })
+    else:
+        top_courses = monitor_cfg.get("courses") or monitor_cfg.get("course_ids") or []
+        if top_courses:
+            for s_code, row in index.items():
+                subject_title = row.get("title") or s_code
+                courses = rows(client.get_subject_courses(row))
+                for target in top_courses:
+                    for c in courses:
+                        if match_course(c, target) and seats_open(c):
+                            open_courses.append({
+                                "subject_title": subject_title,
+                                "subject_code": s_code,
+                                "course_code": c.get("code") or "?",
+                                "course_id": c.get("id"),
+                                "seat_str": seat_str(c),
+                                "open_count": open_seats_count(c),
+                            })
+
+    return open_courses
+
+
+def run_monitor_loop(client, neptun_id, monitor_config_path, webhook):
+    """Continuously monitors courses and alerts on Discord when open seats exist.
+    Never exits unless interrupted by the user (runs forever)."""
+    hr()
+    out(f" Neptun Course Monitor")
+    out(f" User: {neptun_id}")
+    out(f" Config: {monitor_config_path}")
+    if webhook:
+        out(" Discord notifications: ENABLED")
+    else:
+        out(" Discord notifications: DISABLED (no DISCORD_WEBHOOK in .env)")
+    hr()
+
+    try:
+        if not client.authenticate():
+            out(" x Authentication failed. Check .env credentials and base_url.")
+            raise SystemExit(1)
+    except requests.exceptions.RequestException as e:
+        out(f" x Connection error during authentication: {e}")
+        raise SystemExit(1)
+
+    check_num = 0
+    last_notified_state = None
+
+    while True:
+        check_num += 1
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Dynamically reload config in case user updated courses or interval while running
+        try:
+            cfg = load_config(monitor_config_path)
+        except Exception as e:
+            debug(f"Failed to reload {monitor_config_path}: {e}")
+            cfg = {}
+
+        interval = parse_check_interval(cfg)
+        notify_on_change = bool(cfg.get("notify_on_change_only", False))
+
+        try:
+            term_value, term_text = resolve_term(client)
+            if not term_value:
+                out(f"[{now_str}] Check #{check_num}: Failed to resolve active term.")
+            else:
+                index = build_subject_index(client, term_value)
+                open_courses = check_monitored_subjects(client, cfg, index)
+
+                if open_courses:
+                    out()
+                    out(f"[{now_str}] Check #{check_num}: OPEN SPACES FOUND ({len(open_courses)} course(s))!")
+                    lines = ["📢 **Neptun: Open Course Space Detected!**"]
+                    current_state = set()
+
+                    for c in open_courses:
+                        open_cnt = f" ({c['open_count']} seats open)" if c['open_count'] is not None else ""
+                        out(f"    * {c['subject_title']} ({c['subject_code']}) - Course {c['course_code']}: {c['seat_str']}{open_cnt}")
+                        lines.append(f"• **{c['subject_title']}** (`{c['subject_code']}`) → Course **`{c['course_code']}`**: {c['seat_str']}{open_cnt}")
+                        current_state.add((c['subject_code'], str(c['course_id']), c['seat_str']))
+
+                    should_notify = True
+                    if notify_on_change and current_state == last_notified_state:
+                        should_notify = False
+                        debug("Seats unchanged and notify_on_change_only=true; skipping Discord notification.")
+
+                    if should_notify:
+                        msg = "\n".join(lines)
+                        notify(webhook, msg)
+                        last_notified_state = current_state
+                else:
+                    out(f"[{now_str}] Check #{check_num}: All monitored courses are full. No open spaces.")
+                    last_notified_state = set()
+
+        except requests.exceptions.RequestException as e:
+            out(f"[{now_str}] Check #{check_num}: Network/API error: {e}")
+        except Exception as e:
+            out(f"[{now_str}] Check #{check_num}: Unexpected error: {e}")
+
+        out(f"      Sleeping {interval}s until next check (press Ctrl+C to stop)...")
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            out()
+            out(" Monitoring interrupted by user. Exiting.")
+            break
+
+
+# ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
 
@@ -653,7 +888,18 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print debug detail to stderr")
     parser.add_argument("--log", action="store_true", help="Write output to log.txt")
     parser.add_argument("--token-cache", default=".neptun-token.json", help="Path to token cache file")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--monitor",
+        nargs="?",
+        const="monitor.json",
+        default=None,
+        help="Run continuous course monitoring using monitor.json (or specify a custom path)",
+    )
+
+    argv = sys.argv[1:]
+    if argv and argv[0] == "monitor":
+        argv[0] = "--monitor"
+    args = parser.parse_args(argv)
     VERBOSE = args.verbose
 
     if args.log:
@@ -671,6 +917,30 @@ def main():
 
         if not neptun_id or not password:
             raise SystemExit("Set NEPTUNID and NEPTUN_PASSWORD in .env")
+
+        if args.monitor is not None:
+            monitor_path = args.monitor
+            if not os.path.exists(monitor_path):
+                raise SystemExit(
+                    f"Monitor config file not found: {monitor_path}\n"
+                    f"Please create '{monitor_path}' (see monitor.example.json for an example)."
+                )
+
+            monitor_cfg = load_config(monitor_path)
+            base_url = monitor_cfg.get("base_url")
+            if not base_url and os.path.exists(args.config):
+                try:
+                    base_url = load_config(args.config).get("base_url")
+                except Exception:
+                    pass
+            if not base_url:
+                base_url = os.environ.get("NEPTUN_BASE_URL")
+            if not base_url:
+                raise SystemExit("base_url not found in monitor.json, config.json, or NEPTUN_BASE_URL")
+
+            client = NeptunClient(neptun_id, password, base_url=base_url, token_cache_path=args.token_cache)
+            run_monitor_loop(client, neptun_id, monitor_path, webhook)
+            return
 
         config = load_config(args.config)
         base_url = config.get("base_url")

@@ -1,0 +1,15 @@
+{
+	"base_url": "xxx/api",
+	"check_interval": 300,
+	"notify_on_change_only": false,
+	"subjects": [
+		{
+			"neptun_code": "BMEVIAUA001",
+			"courses": ["01", "02"]
+		},
+		{
+			"neptun_code": "BMEVIAUA002",
+			"courses": ["01"]
+		}
+	]
+}

@@ -5,6 +5,7 @@ __pycache__/
 env/
 venv/
 config.json
+monitor.json
 .playwright-mcp/
 .claude
 .neptun-token.json
