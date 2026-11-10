@@ -20,7 +20,9 @@ COURSECHANGE_PATH = "SubjectApplication/CourseChange"
 
 # --- exam endpoints ---
 EXAMS_LIST_PATH = "ExamRegistration/GetExamsList"
-EXAM_REGISTER_PATH = "ExamRegistration/SaveExamRegistration"
+# Exam/course IDs from GetExamsList are bound to the login session (IdExpiredError otherwise),
+# so always sign up with IDs fetched using the same token.
+EXAM_REGISTER_PATH = "ExamRegistration/SignUpForExam"
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +255,26 @@ class NeptunClient:
                          {"sortAndPage.firstRow": 0, "sortAndPage.lastRow": 9999})
 
     def register_exam(self, exam):
-        return self._post(EXAM_REGISTER_PATH, {"examId": exam.get("id")})
+        resp = self.session.post(self._url(EXAM_REGISTER_PATH), json={
+            "examId": exam.get("examId") or exam.get("id"),
+            "courseId": exam.get("courseId"),
+        })
+        if resp.status_code in (200, 201):
+            return resp.json() if resp.text else {}
+        reason = resp.text[:300]
+        try:
+            notes = resp.json().get("notification") or []
+            if notes:
+                reason = "; ".join(n.get("description") or "" for n in notes)
+        except Exception:
+            pass
+        if resp.status_code == 401:
+            # token expired: drop it so the next attempt logs in and refetches (session-bound) IDs
+            Path(self._token_cache_path).unlink(missing_ok=True)
+            self.session.headers.pop("Authorization", None)
+            self.token = None
+        out(f"      Neptun said ({resp.status_code}): {reason}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +523,7 @@ def process_exam(client, idx, total, cfg, exams_by_subject, webhook):
         return False
 
     # Already registered to one of this subject's exams?
-    already = next((e for e in exam_list if e.get("isRegistered") or e.get("isSigned")), None)
+    already = next((e for e in exam_list if e.get("examSignin") or e.get("examSignInId") or e.get("isRegistered") or e.get("isSigned")), None)
     if already:
         out(f"      OK Already registered for exam on {_exam_date(already)}. Nothing to do.")
         return True
@@ -948,6 +969,13 @@ def main():
         exams = config.get("exams", [])
         loop_delay = int(config.get("loop_delay", 30))
         loop_tries = int(config.get("loop_tries", 1))
+        # optional: poll faster for the first fast_minutes after registration_start
+        fast_delay = int(config.get("fast_delay", loop_delay))
+        fast_minutes = float(config.get("fast_minutes", 0))
+        try:
+            loop_until = parse_registration_start(config.get("loop_until"))
+        except ValueError as e:
+            raise SystemExit(f"loop_until: {e}")
         completed = bool(config.get("completed", False))
 
         if completed:
@@ -993,10 +1021,17 @@ def main():
                 out(" All items registered. Exiting.")
                 break
 
+            now = datetime.now().astimezone()
+            if loop_until is not None and now >= loop_until:
+                out(f" Reached loop_until ({loop_until.isoformat()}). Exiting.")
+                break
             if attempt < loop_tries:
-                out(f" Waiting {loop_delay}s before next attempt...")
+                in_fast = (registration_start is not None and fast_minutes > 0 and
+                           (now - registration_start.astimezone()).total_seconds() < fast_minutes * 60)
+                delay = fast_delay if in_fast else loop_delay
+                out(f" Waiting {delay}s before next attempt...")
                 try:
-                    time.sleep(loop_delay)
+                    time.sleep(delay)
                 except KeyboardInterrupt:
                     out()
                     out(" Interrupted. Exiting.")
